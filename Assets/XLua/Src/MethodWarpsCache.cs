@@ -62,7 +62,8 @@ namespace XLua
 
         public void Init(ObjectCheckers objCheckers, ObjectCasters objCasters)
         {
-            if (typeof(Delegate).IsAssignableFrom(targetType) || !method.IsStatic || method.IsConstructor)
+            if ((typeof(Delegate) != targetType && typeof(Delegate).IsAssignableFrom(targetType)) ||
+                !method.IsStatic || method.IsConstructor)
             {
                 luaStackPosStart = 2;
                 if (!method.IsConstructor)
@@ -112,7 +113,8 @@ namespace XLua
                     {
                         if (defalutValue != null && defalutValue.GetType() != paramInfos[i].ParameterType)
                         {
-                            defalutValue = defalutValue.GetType() == typeof(Missing) ? Activator.CreateInstance(paramInfos[i].ParameterType) : Convert.ChangeType(defalutValue, paramInfos[i].ParameterType);
+                            defalutValue = defalutValue.GetType() == typeof(Missing) ? (paramInfos[i].ParameterType.IsValueType() ? Activator.CreateInstance(paramInfos[i].ParameterType) : Missing.Value) 
+                                : Convert.ChangeType(defalutValue, paramInfos[i].ParameterType);
                         }
                         HasDefalutValue = true;
                     }
@@ -177,6 +179,13 @@ namespace XLua
         {
             try
             {
+#if UNITY_EDITOR && !DISABLE_OBSOLETE_WARNING
+                if (method.IsDefined(typeof(ObsoleteAttribute), true))
+                {
+                    ObsoleteAttribute info = Attribute.GetCustomAttribute(method, typeof(ObsoleteAttribute)) as ObsoleteAttribute;
+                    UnityEngine.Debug.LogWarning("Obsolete Method [" + method.DeclaringType.ToString() + "." + method.Name + "]: " + info.Message);
+                } 
+#endif
                 object target = null;
                 MethodBase toInvoke = method;
 
@@ -232,6 +241,11 @@ namespace XLua
 
                 ret = toInvoke.IsConstructor ? ((ConstructorInfo)method).Invoke(args) : method.Invoke(targetNeeded ? target : null, args);
 
+                if (targetNeeded && targetType.IsValueType())
+                {
+                    translator.Update(L, 1, target);
+                }
+
                 int nRet = 0;
 
                 if (!isVoid)
@@ -267,18 +281,20 @@ namespace XLua
     {
         private string methodName;
         private List<OverloadMethodWrap> overloads = new List<OverloadMethodWrap>();
+        private bool forceCheck;
 
-        public MethodWrap(string methodName, List<OverloadMethodWrap> overloads)
+        public MethodWrap(string methodName, List<OverloadMethodWrap> overloads, bool forceCheck)
         {
             this.methodName = methodName;
             this.overloads = overloads;
+            this.forceCheck = forceCheck;
         }
 
         public int Call(RealStatePtr L)
         {
             try
             {
-                if (overloads.Count == 1 && !overloads[0].HasDefalutValue) return overloads[0].Call(L);
+                if (overloads.Count == 1 && !overloads[0].HasDefalutValue && !forceCheck) return overloads[0].Call(L);
 
                 for (int i = 0; i < overloads.Count; ++i)
                 {
@@ -341,7 +357,7 @@ namespace XLua
                 }
                 else
                 {
-                    LuaCSFunction ctor = _GenMethodWrap(type, ".ctor", constructors).Call;
+                    LuaCSFunction ctor = _GenMethodWrap(type, ".ctor", constructors, true).Call;
                     
                     if (type.IsValueType())
                     {
@@ -446,15 +462,20 @@ namespace XLua
             if (!methodsOfType.ContainsKey(eventName))
             {
                 {
-                    EventInfo eventInfo = type.GetEvent(eventName, BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly | BindingFlags.Static);
+                    EventInfo eventInfo = type.GetEvent(eventName, BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly | BindingFlags.Static | BindingFlags.NonPublic);
                     if (eventInfo == null)
                     {
                         throw new Exception(type.Name + " has no event named: " + eventName);
                     }
                     int start_idx = 0;
 
-                    MethodInfo add = eventInfo.GetAddMethod();
-                    MethodInfo remove = eventInfo.GetRemoveMethod();
+                    MethodInfo add = eventInfo.GetAddMethod(true);
+                    MethodInfo remove = eventInfo.GetRemoveMethod(true);
+
+                    if (add == null && remove == null)
+                    {
+                        throw new Exception(type.Name + "'s " + eventName + " has either add nor remove");
+                    }
 
                     bool is_static = add != null ? add.IsStatic : remove.IsStatic;
                     if (!is_static) start_idx = 1;
@@ -474,7 +495,7 @@ namespace XLua
 
                         try
                         {
-                            Delegate handlerDelegate = translator.CreateDelegateBridge(L, eventInfo.EventHandlerType, start_idx + 2);
+                            object handlerDelegate = translator.CreateDelegateBridge(L, eventInfo.EventHandlerType, start_idx + 2);
                             if (handlerDelegate == null)
                             {
                                 return LuaAPI.luaL_error(L, "invalid #" + (start_idx + 2) + ", needed:" + eventInfo.EventHandlerType);
@@ -511,7 +532,7 @@ namespace XLua
             return methodsOfType[eventName];
         }
 
-        public MethodWrap _GenMethodWrap(Type type, string methodName, IEnumerable<MemberInfo> methodBases)
+        public MethodWrap _GenMethodWrap(Type type, string methodName, IEnumerable<MemberInfo> methodBases, bool forceCheck = false)
         { 
             List<OverloadMethodWrap> overloads = new List<OverloadMethodWrap>();
             foreach(var methodBase in methodBases)
@@ -520,28 +541,34 @@ namespace XLua
                 if (mb == null)
                     continue;
 
-                if (mb.IsGenericMethodDefinition && !tryMakeGenericMethod(ref mb))
+                if (mb.IsGenericMethodDefinition
+#if !ENABLE_IL2CPP
+                     && !tryMakeGenericMethod(ref mb)
+#endif
+                    )
                     continue;
 
                 var overload = new OverloadMethodWrap(translator, type, mb);
                 overload.Init(objCheckers, objCasters);
                 overloads.Add(overload);
             }
-            return new MethodWrap(methodName, overloads);
+            return new MethodWrap(methodName, overloads, forceCheck);
         }
 
         private static bool tryMakeGenericMethod(ref MethodBase method)
         {
             try
             {
+                if (!(method is MethodInfo) || !Utils.IsSupportedMethod(method as MethodInfo) )
+                {
+                    return false;
+                }
                 var genericArguments = method.GetGenericArguments();
                 var constraintedArgumentTypes = new Type[genericArguments.Length];
                 for (var i = 0; i < genericArguments.Length; i++)
                 {
                     var argumentType = genericArguments[i];
                     var parameterConstraints = argumentType.GetGenericParameterConstraints();
-                    if (parameterConstraints.Length == 0 || !parameterConstraints[0].IsClass())
-                        return false;
                     constraintedArgumentTypes[i] = parameterConstraints[0];
                 }
                 method = ((MethodInfo)method).MakeGenericMethod(constraintedArgumentTypes);
